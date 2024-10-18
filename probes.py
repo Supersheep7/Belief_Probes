@@ -3,7 +3,7 @@ import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
 from sklearn.model_selection import KFold, cross_val_score
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 import random
 import torch
 import torch.nn as nn
@@ -16,14 +16,11 @@ random.seed(42)
 
 class LogReg():
     
-    def __init__(self, layers):
+    def __init__(self):
         self.layers = [x for x in range(layers)]
         self.data = None
         self.gold = None
         self.probe = LogisticRegression()
-
-    def set_layers(new_layers, self):
-        self.layers = new_layers
 
     def fit(data, gold, self):
         self.probe.fit(data, gold)
@@ -38,7 +35,7 @@ class LogReg():
 
     def save(llm, layer, self):
         with open(f'logreg_{llm}_{layer}.pkl', 'wb') as file:
-            pickle.dump(self.probe, file)
+            pickle.dump(self, file)
 
 class Mmp():
     
@@ -47,9 +44,7 @@ class Mmp():
         self.data = None
         self.gold = None
         self.probe = LogisticRegression()
-
-    def set_layers(new_layers, self):
-        self.layers = new_layers
+        self.lda = LDA(n_components=2)
 
     def cross_validation(self, X, y, cv=5, scoring='accuracy'):             # To test
         kf = KFold(n_splits=cv, shuffle=True, random_state=42)
@@ -57,12 +52,11 @@ class Mmp():
         return scores
     
     def fit(data, gold, self):
-        lda = LDA(n_components=2)
-        data = lda.fit_transform(data, gold)
+        data = self.lda.fit_transform(data, gold)
         self.probe.fit(data, gold)
 
     def predict(data, self):
-        data = LDA.transform(data)
+        data = self.lda.transform(data)
         self.probe.predict(data)
 
     def save(llm, layer, self):
@@ -71,15 +65,11 @@ class Mmp():
 
 class Neural(nn.Module):
     
-    def __init__(self, llm, layers, input_dim, hidden_dim=256, hidden_dim2=128, hidden_dim3=64, output_dim=1, threshold=0.5):
+    def __init__(self, input_dim, hidden_dim=256, hidden_dim2=128, hidden_dim3=64, output_dim=1, threshold=0.5):
         super(Neural, self).__init__()
-        self._initialize_weights()
-        self.device = ("cuda" if torch.cuda.is_available() else "cpu")
-        self.llm = llm
-        self.layers = [x for x in range(layers)]
-        self.data = None
-        self.gold = None
-        self.threshold = threshold
+
+        # Architecture
+
         self.relu = nn.ReLU()
         self.sigmoid = nn.Sigmoid()
         self.fc1 = nn.Linear(input_dim, hidden_dim)
@@ -88,11 +78,20 @@ class Neural(nn.Module):
         self.fc4 = nn.Linear(hidden_dim3, output_dim)
         self.dropout = nn.Dropout(p=0.2)
         self.criterion = nn.BCELoss()
-        self.best = None
+
+        # Hyperparameters
+
+        self._initialize_weights()
+        self.device = ("cuda" if torch.cuda.is_available() else "cpu")
         self.optimizer = Adam()
-        self.train_loader = None
-        self.val_loader = None
-        self.test_loader = None
+        self.threshold = threshold
+        self.best = None
+
+        # Data
+
+        self.llm = "Default"
+        self.layers = [x for x in range(layers)]
+        self.data = None
 
     def _initialize_weights(self):
         nn.init.xavier_uniform_(self.fc1.weight)
@@ -107,11 +106,48 @@ class Neural(nn.Module):
     def set_layers(new_layers, self):
         self.layers = new_layers
 
-    def data_loader(self):
-        pass
+    def set_llm(new_llm, self):
+        self.llm = new_llm
 
-    def cross_validation(self):
-        pass
+    def cross_validation(self, X, y, cv=5):
+        kf = KFold(n_splits=cv, shuffle=True, random_state=42)
+        fold_scores = []
+
+        # Convert data to PyTorch tensors
+        X_tensor = torch.tensor(X, dtype=torch.float32)
+        y_tensor = torch.tensor(y, dtype=torch.float32).unsqueeze(1)  # Reshape y to [n_samples, 1]
+
+        for train_index, val_index in kf.split(X):
+            X_train, X_val = X_tensor[train_index], X_tensor[val_index]
+            y_train, y_val = y_tensor[train_index], y_tensor[val_index]
+
+            # Create PyTorch DataLoader for mini-batch training
+            train_loader = torch.utils.data.DataLoader(
+                dataset=torch.utils.data.TensorDataset(X_train, y_train), 
+                batch_size=self.batch_size, shuffle=True
+            )
+            val_loader = torch.utils.data.DataLoader(
+                dataset=torch.utils.data.TensorDataset(X_val, y_val), 
+                batch_size=self.batch_size, shuffle=False
+            )
+
+            # Reset a fresh model for each fold
+            self.__init__(input_dim=X.shape[1], llm=self.llm, layers=self.layers)
+            criterion = self.criterion
+            optimizer = self.optimizer
+
+            # Train the model
+            self.train(train_loader, criterion, optimizer)
+
+            # Evaluate the model
+            fold_score = self.evaluate(val_loader)
+            fold_scores.append(fold_score)
+            print(f"Fold Score: {fold_score}")
+
+        # Calculate the mean score across all folds
+        mean_score = np.mean(fold_scores)
+        print(f"Mean Cross-Validation Score: {mean_score}")
+        return fold_scores, mean_score
 
     def forward(self, loader, train=False):
         
@@ -131,9 +167,10 @@ class Neural(nn.Module):
         else:
             return preds
 
-    def train(self, epochs=5):
+    def train(self, data_loader, criterion, optimizer, epochs=5):
 
         device = self.device
+        self.train()
         
         for epoch in range(epochs):
             print("epoch no", epoch)
@@ -142,13 +179,12 @@ class Neural(nn.Module):
 
                 X = X.to(device)
                 label = label.to(device)
-                self.optimizer.zero_grad()
 
-                probs = self.forward(X, train=True)
+                probs = self(X, train=True)
                 loss = self.criterion(probs, label)
 
+                self.optimizer.zero_grad()
                 loss.backward()
-
                 self.optimizer.step()
 
                 running_loss += loss.item()
@@ -165,26 +201,52 @@ class Neural(nn.Module):
                         X_val = X_val.to(device)
                         labels_val = labels_val.to(device)
 
-                        preds = self.forward(X_val)
+                        preds = self(X_val)
 
                         true_labels += labels_val.cpu().detach().numpy().tolist()
                         pred_labels += preds.cpu().detach().numpy().tolist()
 
             accuracy = accuracy_score(true_labels, pred_labels)
-            cv_scores.append(accuracy)
 
-            print(f'Epoch [{epoch+1}/{50}], Loss: {running_loss/len(self.train_loader)}')
+            print(f'Epoch [{epoch+1}/{5}], Loss: {running_loss/len(self.train_loader)}')
             print("Accuracy", accuracy)
-            print("Mean_accuracy", np.mean(cv_scores))
 
             if loss.item() < best_score:
                 best_score = loss.item()
                 self.save(self.llm, self.layers) # Self is the best model
                 print("saved model with loss", best_score)
 
+    def evaluate(self, data_loader):
+        self.eval()  # Set model to evaluation mode
+    
+        all_labels = []
+        all_predictions = []
+        
+        with torch.no_grad():
+            for inputs, labels in data_loader:
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+                preds = self(inputs)
+            
+                # Collect true labels and predictions
+                all_labels.extend(labels.cpu().numpy())
+                all_predictions.extend(preds.cpu().numpy())
+
+        # Convert lists to numpy arrays and flatten them
+        all_labels = np.array(all_labels).flatten()
+        all_predictions = np.array(all_predictions).flatten()
+
+        # Generate classification report and confusion matrix
+        report = classification_report(all_labels, all_predictions, target_names=['Class 0', 'Class 1'])
+        conf_matrix = confusion_matrix(all_labels, all_predictions)
+
+        print("Classification Report:\n", report)
+        print("Confusion Matrix:\n", conf_matrix)
+
+        return report, conf_matrix
+
     def test(data, self):
         pass
 
     def save(llm, layer, self):
         with open(f'neural_{llm}_{layer}.pkl', 'wb') as file:
-            pickle.dump(self.probe, file)
+            pickle.dump(self, file)
