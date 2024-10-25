@@ -7,10 +7,16 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 import random
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.optim import Adam
-from torch.utils import data
+from torch.utils.data import DataLoader, TensorDataset
 import pickle
+
+'''
+Here we have the three probes that we will deploy to test for internal representation of belief
+Logreg is a simple logistic regressor
+MMP is a mass-mean probes as described in Marks & Tegmark 2023
+Neural is a tentative copy of SAPLMA as described in Azaria & Mitchell 2023
+'''
 
 random.seed(42)
 
@@ -65,11 +71,13 @@ class Mmp():
 
 class Neural(nn.Module):
     
-    def __init__(self, input_dim, hidden_dim=256, hidden_dim2=128, hidden_dim3=64, output_dim=1, threshold=0.5):
+    def __init__(self, train_data, val_data, test_data, input_dim, hidden_dim=256, hidden_dim2=128, hidden_dim3=64, output_dim=1, threshold=0.5):
         super(Neural, self).__init__()
 
         # Architecture
-
+        self.train_data = train_data            # 70%
+        self.val_data = val_data                # 15%
+        self.test_data = test_data              # 15%
         self.relu = nn.ReLU()
         self.sigmoid = nn.Sigmoid()
         self.fc1 = nn.Linear(input_dim, hidden_dim)
@@ -88,10 +96,8 @@ class Neural(nn.Module):
         self.best = None
 
         # Data
-
+        self.input_dim = input_dim
         self.llm = "Default"
-        self.layers = [x for x in range(layers)]
-        self.data = None
 
     def _initialize_weights(self):
         nn.init.xavier_uniform_(self.fc1.weight)
@@ -103,55 +109,39 @@ class Neural(nn.Module):
         nn.init.xavier_uniform_(self.fc4.weight)
         nn.init.zeros_(self.fc4.bias)
 
+    # The following two functions will be useful to pickle the probes with meaningful filenames
+
     def set_layers(new_layers, self):
         self.layers = new_layers
 
     def set_llm(new_llm, self):
         self.llm = new_llm
 
-    def cross_validation(self, X, y, cv=5):
+    def cross_validation(self, cv=5):
         kf = KFold(n_splits=cv, shuffle=True, random_state=42)
         fold_scores = []
+        data = self.train_data
 
-        # Convert data to PyTorch tensors
-        X_tensor = torch.tensor(X, dtype=torch.float32)
-        y_tensor = torch.tensor(y, dtype=torch.float32).unsqueeze(1)  # Reshape y to [n_samples, 1]
-
-        for train_index, val_index in kf.split(X):
-            X_train, X_val = X_tensor[train_index], X_tensor[val_index]
-            y_train, y_val = y_tensor[train_index], y_tensor[val_index]
-
-            # Create PyTorch DataLoader for mini-batch training
-            train_loader = torch.utils.data.DataLoader(
-                dataset=torch.utils.data.TensorDataset(X_train, y_train), 
-                batch_size=self.batch_size, shuffle=True
-            )
-            val_loader = torch.utils.data.DataLoader(
-                dataset=torch.utils.data.TensorDataset(X_val, y_val), 
-                batch_size=self.batch_size, shuffle=False
-            )
-
+        for train_index, val_index in kf.split(data):
+            
+            data_train, data_val = data[train_index], data[val_index]
+            
             # Reset a fresh model for each fold
-            self.__init__(input_dim=X.shape[1], llm=self.llm, layers=self.layers)
+            self.__init__(self.train_data, self.val_data, self.test_data, input_dim=self.input_dim)
+
             criterion = self.criterion
             optimizer = self.optimizer
-
-            # Train the model
-            self.train(train_loader, criterion, optimizer)
-
-            # Evaluate the model
-            fold_score = self.evaluate(val_loader)
+            fold_score = self.train(data_train, data_val, criterion, optimizer)
             fold_scores.append(fold_score)
             print(f"Fold Score: {fold_score}")
 
-        # Calculate the mean score across all folds
         mean_score = np.mean(fold_scores)
         print(f"Mean Cross-Validation Score: {mean_score}")
         return fold_scores, mean_score
 
-    def forward(self, loader, train=False):
+    def forward(self, data, train=False):
         
-        stream = nn.Flatten()(loader[0, :]) # We have to understand what shape the loader passes 
+        stream = nn.Flatten()(data) # Data should be passed through dataloader 
         out = self.fc1(stream)
         out = self.dropout(out)
         out = self.relu(out)
@@ -163,90 +153,135 @@ class Neural(nn.Module):
         preds = (probs >= self.threshold).float()
 
         if train:
-            return probs
+            return probs    # We want to calculate loss 
         else:
             return preds
 
-    def train(self, data_loader, criterion, optimizer, epochs=5):
+    def train(self, data_train=None, data_val=None, criterion=nn.BCELoss(), optimizer=Adam(), epochs=5, cross=False):
 
         device = self.device
-        self.train()
+        criterion = self.criterion
+        optimizer = self.optimizer
+        best_score = float('inf')
+
+        # Workaround for self in default argument 
+        if data_train is None: 
+            data_train = self.train_data
+        if data_val is None: 
+            data_val = self.val_data
+
+        X_train = data_train[:, 0]
+        y_train = data_train[:, 1]
+        X_val = data_val[:, 0]
+        y_val = data_val[:, 1]
+
+        # Push tensors in dataloader
+
+        X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+        y_train_tensor = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)  
+        X_val_tensor = torch.tensor(X_val, dtype=torch.float32)
+        y_val_tensor = torch.tensor(y_val, dtype=torch.float32).unsqueeze(1)  
+        train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+        val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
+        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
         
         for epoch in range(epochs):
+            
+            self.train()
             print("epoch no", epoch)
             running_loss = 0.0
-            for X, label in self.train_loader:
+
+            for X_batch, y_batch in train_loader:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                
+                optimizer.zero_grad()
+                
+                outputs = self(X_batch, train=True)  
+                loss = criterion(outputs, y_batch)  
+                
+                loss.backward()
+                optimizer.step()
+                
+                running_loss += loss.item()  
+
+            # Epoch done. Switch to evaluation
+                
+            self.eval()
+
+            with torch.no_grad():
+
+                true_labels = []
+                pred_labels = []
+
+                for X_val, labels_val in val_loader:
+
+                    X_val = X_val.to(device)
+                    labels_val = labels_val.to(device)
+
+                    preds = self(X_val)
+
+                    true_labels += labels_val.cpu().detach().numpy().tolist()
+                    pred_labels += preds.cpu().detach().numpy().tolist()
+
+                accuracy = accuracy_score(true_labels, pred_labels)
+                report = classification_report(true_labels, pred_labels, target_names=['Class 0', 'Class 1'])
+                conf_matrix = confusion_matrix(true_labels, pred_labels)
+
+                print(f'Epoch [{epoch+1}/{5}], Loss: {running_loss/len(train_loader)}')
+                print("Accuracy", accuracy)
+                print("Classification Report:\n", report)
+                print("Confusion Matrix:\n", conf_matrix)
+
+                if loss.item() < best_score:
+                    best_score = loss.item()
+                    best_accuracy = accuracy
+                    self.save(self.llm, self.layers)     # Save best model with the name of the llm and the interested layer(s)
+                    print("saved model with loss", best_score)
+
+        if cross: 
+            return best_accuracy
+
+    def test(self, data_test=None):
+
+        device = self.device
+
+        if data_test is None:
+            data_test = self.test_data
+
+        X = data_test[:, 0]
+        y = data_test[:, 1]
+        X_tensor = torch.tensor(X, dtype=torch.float32).to(device)
+        y_tensor = torch.tensor(y, dtype=torch.float32).unsqueeze(1).to(device)  
+        test_dataset = TensorDataset(X_tensor, y_tensor)
+        test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+        self.eval()
+
+        with torch.no_grad():
+
+            true_labels = []
+            pred_labels = []
+
+            for X, labels in test_loader:
 
                 X = X.to(device)
-                label = label.to(device)
+                labels = labels.to(device)
 
-                probs = self(X, train=True)
-                loss = self.criterion(probs, label)
+                preds = self(X)
 
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
-
-                running_loss += loss.item()
-
-                self.eval()
-
-                with torch.no_grad():
-
-                    true_labels = []
-                    pred_labels = []
-
-                    for X_val, labels_val in self.val_loader:
-
-                        X_val = X_val.to(device)
-                        labels_val = labels_val.to(device)
-
-                        preds = self(X_val)
-
-                        true_labels += labels_val.cpu().detach().numpy().tolist()
-                        pred_labels += preds.cpu().detach().numpy().tolist()
+                true_labels += labels.cpu().detach().numpy().tolist()
+                pred_labels += preds.cpu().detach().numpy().tolist()
 
             accuracy = accuracy_score(true_labels, pred_labels)
+            report = classification_report(true_labels, pred_labels, target_names=['Class 0', 'Class 1'])
+            conf_matrix = confusion_matrix(true_labels, pred_labels)
 
-            print(f'Epoch [{epoch+1}/{5}], Loss: {running_loss/len(self.train_loader)}')
             print("Accuracy", accuracy)
+            print("Classification Report:\n", report)
+            print("Confusion Matrix:\n", conf_matrix)
 
-            if loss.item() < best_score:
-                best_score = loss.item()
-                self.save(self.llm, self.layers) # Self is the best model
-                print("saved model with loss", best_score)
+        return accuracy, report, conf_matrix
 
-    def evaluate(self, data_loader):
-        self.eval()  # Set model to evaluation mode
-    
-        all_labels = []
-        all_predictions = []
-        
-        with torch.no_grad():
-            for inputs, labels in data_loader:
-                inputs, labels = inputs.to(self.device), labels.to(self.device)
-                preds = self(inputs)
-            
-                # Collect true labels and predictions
-                all_labels.extend(labels.cpu().numpy())
-                all_predictions.extend(preds.cpu().numpy())
-
-        # Convert lists to numpy arrays and flatten them
-        all_labels = np.array(all_labels).flatten()
-        all_predictions = np.array(all_predictions).flatten()
-
-        # Generate classification report and confusion matrix
-        report = classification_report(all_labels, all_predictions, target_names=['Class 0', 'Class 1'])
-        conf_matrix = confusion_matrix(all_labels, all_predictions)
-
-        print("Classification Report:\n", report)
-        print("Confusion Matrix:\n", conf_matrix)
-
-        return report, conf_matrix
-
-    def test(data, self):
-        pass
-
-    def save(llm, layer, self):
+    def save(self, llm, layer):
         with open(f'neural_{llm}_{layer}.pkl', 'wb') as file:
             pickle.dump(self, file)
